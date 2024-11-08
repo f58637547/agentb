@@ -1,115 +1,112 @@
-"""Test Human in the Loop Agent"""
+"""Test Q&A Agent"""
 
 import os
-from typing import Any, cast
+from typing import cast
 from langchain_openai import ChatOpenAI
 from langchain_anthropic import ChatAnthropic
 from langgraph.graph import StateGraph, END
 from langgraph.graph import MessagesState
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.runnables import RunnableConfig
-from langchain_core.messages import HumanMessage, ToolMessage, AIMessage
+from langchain_core.messages import HumanMessage, AIMessage
 from copilotkit.langchain import (
-  copilotkit_customize_config, copilotkit_exit, copilotkit_emit_message
+    copilotkit_exit,
+    copilotkit_emit_message
 )
 from pydantic import BaseModel, Field
+from my_agent.state import GreetAgentState
+from my_agent.model import get_model
 
-
-def get_model():
+class ExtractNameTool(BaseModel):
     """
-    Get a model based on the environment variable.
+    Extract the user's name from the message.
+    Make sure to only set the name if you are 100 percent sure it is the name of the user.
     """
-    model = os.getenv("MODEL", "openai")
+    name: str = Field(..., description="The user's name or UNKNOWN if you can't find it")
 
-    if model == "openai":
-        return ChatOpenAI(temperature=0, model="gpt-4o")
-    if model == "anthropic":
-        return ChatAnthropic(
-            temperature=0,
-            model_name="claude-3-5-sonnet-20240620",
-            timeout=None,
-            stop=None
-        )
-
-    raise ValueError("Invalid model specified")
-
-
-class EmailAgentState(MessagesState):
-    """Email Agent State"""
-    email: str
-
-class EmailTool(BaseModel):
+async def ask_name_node(state: GreetAgentState, config: RunnableConfig):
     """
-    Write an email.
-    """
-    email_draft: str = Field(description="The draft of the email to be written.")
-
-
-async def draft_email_node(state: EmailAgentState, config: RunnableConfig):
-    """
-    Write an email.
+    Ask the user for their name.
     """
 
-    config = copilotkit_customize_config(
-        config,
-        emit_tool_calls=True,
+    await copilotkit_emit_message(config, "Hey, what is your name? 🙂")
+
+    return {
+        "messages": state["messages"],
+    }
+
+
+async def extract_name_node(state: GreetAgentState, config: RunnableConfig):
+    """
+    Check if the user's name is in the message.
+    """
+
+    last_message = cast(HumanMessage, state["messages"][-1])
+
+
+    instructions = (
+        f"Figure out the user's name if possible from this response they gave you: {last_message.content}"
     )
 
-    instructions = "You write emails."
-
-    email_model = get_model().bind_tools(
-        [EmailTool],
-        tool_choice="EmailTool"
+    model = get_model(state).bind_tools(
+        [ExtractNameTool],
+        tool_choice="ExtractNameTool"
     )
 
-    response = await email_model.ainvoke([
+    response = await model.ainvoke([
         *state["messages"],
         HumanMessage(
             content=instructions
         )
     ], config)
 
-    tool_calls = cast(Any, response).tool_calls
+    tool_calls = cast(AIMessage, response).tool_calls
+    name = None
 
-    # the email content is the argument passed to the email tool
-    email = tool_calls[0]["args"]["email_draft"]
+    if tool_calls is not None:
+        if tool_calls[0]["args"]["name"] != "UNKNOWN":
+            name = tool_calls[0]["args"]["name"]
+
+    if name is None:
+        return {
+            "messages": state["messages"],
+        }
 
     return {
-        "email": email,
+        "messages": state["messages"],
+        "name": name,
     }
 
-async def send_email_node(state: EmailAgentState, config: RunnableConfig):
+async def greet_node(state: GreetAgentState, config: RunnableConfig):
     """
-    Send an email.
+    Greet the user by name.
     """
 
-    config = copilotkit_customize_config(
-        config,
-        emit_messages=True,
-    )
+    await copilotkit_emit_message(config, "Hello, " + state["name"] + " 😎")
 
     await copilotkit_exit(config)
 
-    # get the last message and cast to ToolMessage
-    last_message = cast(ToolMessage, state["messages"][-1])
-    message_to_add = ""
-    if last_message.content == "CANCEL":
-        message_to_add = "❌ Cancelled sending email."
-    else:
-        message_to_add = "✅ Sent email."
-
-    await copilotkit_emit_message(config, message_to_add)
     return {
-        "messages": state["messages"] + [AIMessage(content=message_to_add)],
+        "messages": state["messages"],
     }
 
+def route(state: GreetAgentState):
+    """Route to the appropriate node."""
 
-workflow = StateGraph(EmailAgentState)
-workflow.add_node("draft_email_node", draft_email_node)
-workflow.add_node("send_email_node", send_email_node)
-workflow.set_entry_point("draft_email_node")
+    if state.get("name", None) is not None:
+        return "greet_node"
+    return "ask_name_node"
 
-workflow.add_edge("draft_email_node", "send_email_node")
-workflow.add_edge("send_email_node", END)
+workflow = StateGraph(GreetAgentState)
+
+workflow.add_node("ask_name_node", ask_name_node)
+workflow.add_node("greet_node", greet_node)
+workflow.add_node("extract_name_node", extract_name_node)
+
+workflow.set_entry_point("ask_name_node")
+
+workflow.add_edge("ask_name_node", "extract_name_node")
+workflow.add_conditional_edges("extract_name_node", route)
+workflow.add_edge("greet_node", END)
 memory = MemorySaver()
-graph = workflow.compile(checkpointer=memory, interrupt_after=["draft_email_node"])
+graph = workflow.compile(checkpointer=memory, interrupt_after=["ask_name_node"])
